@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--teach", action="store_true", help="Generate teach_pack.md Socratic learning pack")
     parser.add_argument("--model", type=str, default="gemini-3.8-flash", help="Gemini model tier (default: gemini-3.8-flash)")
     parser.add_argument("--explicit-cache", action="store_true", help="Use explicit cache creation instead of implicit caching")
+    parser.add_argument("--ttl-mins", type=int, default=15, help="Explicit cache Time-To-Live in minutes (default: 15)")
     parser.add_argument("--out", type=str, default="out", help="Directory to save audit report and teach pack")
     args = parser.parse_args()
 
@@ -33,12 +34,14 @@ def main():
     print("=" * 70)
     print(" SANITY ENGINE CACHED: GEMINI LONG-CONTEXT AUDITOR")
     print(f" Model: {args.model}")
+    print(f" Cache Mode: {'Explicit (TTL: ' + str(args.ttl_mins) + 'm)' if args.explicit_cache else 'Implicit Prefix ($0 storage)'}")
     print("=" * 70)
 
     engine = SanityEngineCached(
         corpus_dir="corpus",
         model_name=args.model,
         use_explicit_cache=args.explicit_cache,
+        ttl_mins=args.ttl_mins,
     )
 
     print(f"[+] Loaded ~{engine.prefix_tokens:,} tokens into reference context.")

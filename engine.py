@@ -59,12 +59,14 @@ class SanityEngineCached:
         model_name: Optional[str] = None,
         profile: str = "cached_500k",
         use_explicit_cache: bool = False,
+        ttl_mins: int = 15,
     ):
         self.profile = profile
         self.corpus_mgr = CorpusManager(corpus_dir=corpus_dir, profile=profile)
         self.cached_prefix, self.prefix_tokens = self.corpus_mgr.build_cached_prefix()
         self.model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
         self.use_explicit_cache = use_explicit_cache
+        self.ttl_mins = ttl_mins
         self.client = None
         self.explicit_cache_id = None
         self._init_client()
@@ -88,9 +90,35 @@ class SanityEngineCached:
             try:
                 from google import genai
                 self.client = genai.Client(api_key=api_key)
+                if self.use_explicit_cache:
+                    self._create_explicit_cache()
             except Exception as e:
                 print(f"[!] Warning: Could not initialize Google GenAI: {e}")
                 self.client = None
+
+    def _create_explicit_cache(self):
+        """Creates an explicit CachedContent object with user-specified TTL in minutes."""
+        if not self.client:
+            return
+        ttl_seconds = max(self.ttl_mins * 60, 300)
+        try:
+            from google.genai import types
+            cache = self.client.caches.create(
+                model=self.model_name,
+                config=types.CreateCachedContentConfig(
+                    contents=[self.cached_prefix],
+                    system_instruction=(
+                        "You are a strict, skeptical biophysics and physical science peer reviewer. "
+                        "Evaluate hypotheses against the attached canonical reference library."
+                    ),
+                    ttl=f"{ttl_seconds}s",
+                ),
+            )
+            self.explicit_cache_id = cache.name
+            print(f"[+] Explicit cache created: {cache.name} (TTL: {self.ttl_mins}m / {ttl_seconds}s)")
+        except Exception as e:
+            print(f"[!] Explicit cache creation failed (falling back to implicit prefix caching): {e}")
+            self.explicit_cache_id = None
 
     def run_math_firewall(self, text: str) -> Dict[str, Any]:
         """Level 0 Firewall: Deterministic equation and unit validation."""

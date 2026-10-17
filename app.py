@@ -34,7 +34,7 @@ with st.sidebar:
     st.header("⚙️ Engine Configuration")
     model_choice = st.selectbox(
         "Gemini Model Tier",
-        ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-4-argon"],
+        ["gemini-3.8-flash", "gemini-4-argon", "gemini-2.5-pro"],
         index=0,
         help="Gemini Flash models support 1M context with 90% cache discounts (~$0.01/call).",
     )
@@ -43,9 +43,17 @@ with st.sidebar:
         ["Implicit Prefix Caching (Auto / $0 storage)", "Explicit Session Cache (TTL-based)"],
         index=0,
     )
+    ttl_mins = st.number_input(
+        "Cache TTL (minutes)",
+        min_value=5,
+        max_value=1440,
+        value=15,
+        step=5,
+        help="Lifetime of the cached textbook context in memory. Default is 15 minutes to minimize idle storage fees.",
+    )
     st.divider()
     st.markdown("### 📚 Reference Library Context")
-    st.info("~500,000 tokens of canonical textbooks pre-loaded (Berg, Feynman, Johnston & Wu, Winter, Cover, etc.).")
+    st.info(f"~500,000 tokens of canonical textbooks pre-loaded (TTL: {ttl_mins}m).")
     
     nb_url = os.environ.get("NOTEBOOKLM_URL", "https://notebook.google.com/notebook/3eed2329-aeef-4e67-81ef-c5bc2c06f5bd")
     if nb_url:
@@ -79,6 +87,7 @@ if run_btn:
                 corpus_dir="corpus",
                 model_name=model_choice,
                 use_explicit_cache="Explicit" in cache_mode,
+                ttl_mins=int(ttl_mins),
             )
             result = engine.evaluate_hypothesis(
                 hypothesis_text=hypothesis_input,
