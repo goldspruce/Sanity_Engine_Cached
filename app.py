@@ -1,43 +1,60 @@
-"""Streamlit Dashboard for Sanity_Engine_Cached.
-
-Provides an interactive GUI for:
-1. Running Dual-Track Long-Context Audits using Gemini Flash with Context Caching.
-2. Visualizing Level 0 Mathematical consistency checks (SymPy / Pint).
-3. Reviewing the Falsification Issue Board with verified textbook quotes.
-4. Generating and downloading the Socratic teach_pack.md for NotebookLM.
-"""
-
-import json
-import os
-import streamlit as st
-
+import os, sys, json, time, urllib.parse, urllib.request, re, io
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-
-from engine import SanityEngineCached
+import docx
+import streamlit as st
+import engine, triage
 from teach import generate_teach_pack
 
-st.set_page_config(
-    page_title="Sanity Engine Cached | Gemini Long-Context Auditor",
-    page_icon="🔬",
-    layout="wide",
-)
+def docx_text(b):
+    d = docx.Document(io.BytesIO(b) if hasattr(b, 'read') else io.BytesIO(b))
+    return "\n\n".join(p.text for p in d.paragraphs if p.text.strip())
 
-st.title("🔬 Sanity Engine Cached")
-st.caption("Adversarial Scientific Falsification powered by Gemini Long-Context Caching & Level 0 Math Firewall")
+def gdoc_text(url):
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+    if not m:
+        raise ValueError("Could not find a valid Google Doc ID in the link.")
+    gid = m.group(1)
+    req = urllib.request.Request(f"https://docs.google.com/document/d/{gid}/export?format=txt",
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as r:
+        return r.read().decode("utf-8", "ignore")
 
-# Sidebar Configuration
+def safe_json_dumps(obj, indent=1):
+    def default(o):
+        if isinstance(o, (set, tuple)):
+            return list(o)
+        return str(o)
+    return json.dumps(obj, indent=indent, default=default)
+
+st.set_page_config(page_title="Sanity Engine", layout="wide")
+st.title("Sanity Engine")
+
+nb_url = os.getenv("NOTEBOOKLM_URL", "https://notebook.google.com/notebook/3eed2329-aeef-4e67-81ef-c5bc2c06f5bd")
+
+with st.expander("📚 Pre-Loaded Canonical Textbooks in Corpus & NotebookLM (11)", expanded=False):
+    st.markdown(f"🔗 **Google NotebookLM Workspace:** [{nb_url}]({nb_url})")
+    st.markdown("""
+    All reference textbooks are indexed in `corpus/` for deterministic BM25 retrieval and quote verification:
+    - **Alberts et al. (7th ed., 2022)**: `Alberts_Molecular_Biology_of_the_Cell_7ed_2022` *(Cell biology, cross-bridges, motors)*
+    - **Berg (1993)**: `Berg_Random_Walks_in_Biology_1993` *(Diffusion, Brownian motion, motility, low Reynolds number)*
+    - **Cover & Thomas (2nd ed., 2006)**: `Cover_Elements_of_Information_Theory_2ed_2006` *(Information theory, channel capacity, rate distortion)*
+    - **Feynman et al. (Vol. 1, 1963)**: `Feynman_Lectures_on_Physics_Vol1_1963` *(Mechanics, oscillations, radiation, heat, acoustics)*
+    - **Feynman et al. (Vol. 2, 1964)**: `Feynman_Lectures_on_Physics_Vol2_1964` *(Electromagnetism, wave propagation, dielectric media)*
+    - **Johnston & Wu (1st ed., 1995)**: `Johnston_Foundations_of_Cellular_Neurophysiology_1ed_1995` *(Cellular neurophysiology, cable theory, ion channels)*
+    - **Kreyszig (10th ed., 2011)**: `Kreyszig_Advanced_Engineering_Mathematics_10ed_2011` *(Wave equations, PDEs, Fourier/Laplace transforms)*
+    - **Murray (2nd ed., 1993)**: `Murray_Mathematical_Biology_an_Introduction_2ed_1993` *(Mathematical biology, reaction-diffusion, population dynamics)*
+    - **Nelson & Cox (8th ed., 2021)**: `Nelson_Lehninger_Principles_of_Biochemistry_8ed_2021` *(Biochemistry, ATP kinetics, bioenergetics, metabolic flux)*
+    - **Strogatz (3rd ed., 2024)**: `Strogatz_Nonlinear_Dynamics_and_Chaos_3ed_2024` *(Nonlinear dynamics, limit cycles, bifurcations, oscillators)*
+    - **Winter (5th ed., 2020)**: `Winter_Biomechanics_and_Motor_Control_of_Human_Movement_5ed_2020` *(Joint kinetics, EMG, muscle power, stretch-shortening cycle)*
+    """)
+
 with st.sidebar:
-    st.header("⚙️ Engine Configuration")
-    model_choice = st.selectbox(
-        "Gemini Model Tier",
-        ["gemini-3.8-flash", "gemini-4-argon", "gemini-2.5-pro"],
-        index=0,
-        help="Gemini Flash models support 1M context with 90% cache discounts (~$0.01/call).",
-    )
+    gen_name = st.selectbox("Generator model", ["gemini", "anthropic", "mock"], index=0)
+    critic_name = st.selectbox("Reviewer model", ["same as generator", "gemini", "anthropic", "mock"], index=0)
     cache_mode = st.radio(
         "Caching Mechanism",
         ["Implicit Prefix Caching (Auto / $0 storage)", "Explicit Session Cache (TTL-based)"],
@@ -49,137 +66,228 @@ with st.sidebar:
         max_value=1440,
         value=15,
         step=5,
-        help="Lifetime of the cached textbook context in memory. Default is 15 minutes to minimize idle storage fees.",
+        help="Lifetime of the cached textbook context in GPU memory. Default is 15 minutes to minimize idle storage fees.",
     )
+    corpus = st.text_input("Corpus folder", "corpus")
+    if os.path.isdir(corpus):
+        with st.expander(f"Books in `{corpus}/`", expanded=False):
+            for bf in sorted(os.listdir(corpus)):
+                if bf.lower().endswith((".txt", ".md")):
+                    st.caption(f"• `{os.path.splitext(bf)[0]}`")
+    books = st.text_input("Book names to focus on in model recall?", "",
+                          help="Optional. Leave blank to default to all books in your corpus folder.")
+    review = st.checkbox("Create expert review cards (Original Prompt & Follow-ups)", value=True)
+    teach = st.checkbox("Generate Socratic Teaching Pack (`teach_pack.md`)", value=True)
+    entail = st.checkbox("Auto entailment pre-check")
+    check_math = st.checkbox("Math / number verification (optional)", value=False)
+
+    if st.button("🔄 Reset / New Prompt", help="Clear current session and start with a new original prompt"):
+        st.session_state["report"] = None
+        st.session_state["latest_report"] = None
+        st.session_state["followup_reports"] = []
+        st.session_state["follow_up_history"] = []
+        st.session_state["original_cards"] = None
+        st.session_state["session_active"] = True
+        st.rerun()
+
     st.divider()
-    st.markdown("### 📚 Reference Library Context")
-    st.info(f"~500,000 tokens of canonical textbooks pre-loaded (TTL: {ttl_mins}m).")
+    if st.button("🛑 End Session (Exit)", help="Stop the local server and exit Python process"):
+        st.session_state["session_active"] = False
+        st.warning("Session ended. Server stopped. You can safely close this browser tab.")
+        time.sleep(0.5)
+        os._exit(0)
+
+if not st.session_state.get("session_active", True):
+    st.warning("🛑 Session has ended. You can review past results below, or restart a new session.")
+    if st.button("🔄 Start New Session", type="primary"):
+        st.session_state["session_active"] = True
+        st.session_state["report"] = None
+        st.session_state["latest_report"] = None
+        st.session_state["followup_reports"] = []
+        st.session_state["follow_up_history"] = []
+        st.session_state["original_cards"] = None
+        st.rerun()
+
+text = st.text_area("Original Prompt", height=200)
+up = st.file_uploader("...or upload .docx / .txt / .md", type=["docx", "txt", "md"])
+link = st.text_input("...or Google Doc link (must be viewable by anyone with the link)")
+if up:
+    text = docx_text(up.getvalue()) if up.name.lower().endswith(".docx") else up.getvalue().decode("utf-8", "ignore")
+elif link and not text:
+    try:
+        text = gdoc_text(link)
+    except Exception as e:
+        st.error(f"Could not read the Google Doc: {e}")
+if text:
+    text = st.text_area("Text that will be checked (edit if extraction dropped anything)", text, height=200, key="confirm")
+
+def backend(name):
+    if name == "mock":
+        from mock_llm import MockLLM
+        return MockLLM()
+    if name == "gemini":
+        return engine.GeminiLLM(ttl_mins=int(ttl_mins), use_cache="Explicit" in cache_mode)
+    return engine.AnthropicLLM()
+
+def books_default(corpus):
+    return "; ".join(sorted({os.path.splitext(f)[0] for f in os.listdir(corpus) if f.lower().endswith((".txt", ".md"))})) or "(none listed)"
+
+if st.button("Run", disabled=not text, type="primary"):
+    try:
+        gen = backend(gen_name)
+        crit = gen if critic_name == "same as generator" else backend(critic_name)
+        with st.spinner("Running adversarial review on Original Prompt with Gemini Context Caching..."):
+            rep = engine.run(text, books or books_default(corpus), gen, crit, engine.LocalBM25(corpus), auto_entail=entail,
+                             check_math=check_math, log=lambda m: None)
+            st.session_state["report"] = rep
+            st.session_state["latest_report"] = rep
+            st.session_state["followup_reports"] = []
+            st.session_state["follow_up_history"] = []
+            st.session_state["session_active"] = True
+            if review:
+                t_res = triage.build(rep, label="Original Prompt", prefix="cards_original")
+                st.session_state["original_cards"] = t_res["files"]
+            else:
+                st.session_state["original_cards"] = None
+    except Exception as e:
+        st.error(f"{type(e).__name__}: {e}")
+
+if st.session_state.get("report"):
+    rep = st.session_state["report"]
+    counts = rep.get("counts") or engine.count_flags(rep.get("issues", []), rep.get("green_flags", []))
+    col_r, col_y, col_g = st.columns(3)
+    col_r.metric("🚩 Red Flags", counts.get("red", 0), help="Fatal physical or biological invariant violations")
+    col_y.metric("🟨 Yellow Flags", counts.get("yellow", 0), help="Empirical friction & parameter regime constraints (requires edge conditions)")
+    col_g.metric("🟩 Green Flags", counts.get("green", 0), help="Biophysically sound mechanisms & canonical principles")
+
+    rendered = engine.render(rep)
+    st.markdown(rendered)
+    st.divider()
+    st.subheader("📥 Downloads & Review Cards — Original Prompt")
     
-    nb_url = os.environ.get("NOTEBOOKLM_URL", "https://notebook.google.com/notebook/3eed2329-aeef-4e67-81ef-c5bc2c06f5bd")
-    if nb_url:
-        st.link_button("🔗 Open Shared NotebookLM Library", nb_url)
-
-# Main Input Section
-col_left, col_right = st.columns([2, 1])
-
-with col_left:
-    hypothesis_input = st.text_area(
-        "Scientific Hypothesis / Mechanism",
-        height=180,
-        placeholder="Describe the biological/physical mechanism, variables, and scaling assumptions...\n\nExample:\nWe propose that intracellular transport across a 15-micrometer neuron soma occurs via unimpeded molecular diffusion, with Brownian motion delivering vesicles at a characteristic velocity of v = 50 um/s.",
-    )
-
-with col_right:
-    blind_guess = st.text_input(
-        "Blind-First Guess (Pre-Audit Intuition)",
-        placeholder="What do you guess is the #1 physical limit on this idea?",
-        help="Answering this before the audit improves Socratic reflection and mirrors peer-review best practices.",
-    )
-    generate_teach = st.checkbox("Generate Socratic Teaching Pack (`teach_pack.md`)", value=True)
-    run_btn = st.button("🚀 Run Adversarial Audit", type="primary", use_container_width=True)
-
-if run_btn:
-    if not hypothesis_input.strip():
-        st.warning("Please enter a hypothesis to audit.")
-    else:
-        with st.spinner("Analyzing hypothesis against ~500k-token canonical textbook library..."):
-            engine = SanityEngineCached(
-                corpus_dir="corpus",
-                model_name=model_choice,
-                use_explicit_cache="Explicit" in cache_mode,
-                ttl_mins=int(ttl_mins),
+    num_cols = 3 if teach else 2
+    dl_cols = st.columns(num_cols)
+    with dl_cols[0]:
+        st.download_button("📥 Download report_original.md", rendered, "report_original.md", mime="text/markdown", key="dl_report_md")
+    with dl_cols[1]:
+        st.download_button("📥 Download report_original.json", safe_json_dumps(rep, indent=1), "report_original.json", mime="application/json", key="dl_report_json")
+    if teach:
+        with dl_cols[2]:
+            teach_md = generate_teach_pack(
+                hypothesis_text=rep.get("hypothesis", text),
+                blind_guess="",
+                verdict=rep.get("badge", "EVALUATED"),
+                issues=rep.get("issues", []),
+                edge_conditions=[],
+                notebooklm_url=nb_url,
             )
-            result = engine.evaluate_hypothesis(
-                hypothesis_text=hypothesis_input,
-                blind_guess=blind_guess,
-            )
-            st.session_state["last_result"] = result
-            st.session_state["last_hypothesis"] = hypothesis_input
-            st.session_state["last_blind_guess"] = blind_guess
+            st.download_button("📥 Download teach_pack.md", teach_md, "teach_pack.md", mime="text/markdown", key="dl_teach_md")
+    
+    if st.session_state.get("original_cards"):
+        st.markdown("##### 🃏 Expert Review Cards — Original Prompt")
+        orig_files = st.session_state["original_cards"]
+        c_cols = st.columns(len(orig_files))
+        for idx, (fn, content) in enumerate(orig_files.items()):
+            with c_cols[idx]:
+                st.download_button(f"📥 Download {fn}", content, fn, key=f"dl_orig_{fn}")
+        with st.expander("🔍 Preview Review Cards (Original Prompt)", expanded=False):
+            st.markdown(orig_files.get("cards_original.md", ""))
 
-if "last_result" in st.session_state:
-    res = st.session_state["last_result"]
-    verdict = res.get("verdict", "UNKNOWN")
+    # Continuous Follow-Up Section
+    st.divider()
+    st.subheader("💬 Continuous Follow-Up Research & Refinement")
+    st.caption("Ask questions, test edge conditions, or refine the prompt. The engine maintains continuous research across follow-up inquiries: querying literature, tracking resolved vs. persisting flags, generating verified reports, and producing expert review cards for each follow-up. Type **exit** or click **🛑 End Session** in the sidebar to finish.")
 
-    # Verdict Banner
-    if verdict == "SOUND":
-        st.success(f"### Verdict: {verdict} (Confidence: {res.get('confidence')}%)")
-    elif verdict == "CONDITIONALLY_PLAUSIBLE":
-        st.warning(f"### Verdict: {verdict} (Confidence: {res.get('confidence')}%)")
-    else:
-        st.error(f"### Verdict: {verdict} (Confidence: {res.get('confidence')}%)")
+    for idx, msg in enumerate(st.session_state.get("follow_up_history", [])):
+        with st.chat_message(msg["role"]):
+            if msg.get("report") and msg.get("turn"):
+                turn_num = msg["turn"]
+                f_rep = msg["report"]
+                f_counts = f_rep.get("counts") or engine.count_flags(f_rep.get("active_issues", f_rep.get("issues", [])), f_rep.get("green_flags", []))
+                st.markdown(f"### 📄 Follow-up #{turn_num} Evaluation")
+                fcol_r, fcol_y, fcol_g = st.columns(3)
+                fcol_r.metric("🚩 Red Flags", f_counts.get("red", 0))
+                fcol_y.metric("🟨 Yellow Flags", f_counts.get("yellow", 0))
+                fcol_g.metric("🟩 Green Flags", f_counts.get("green", 0))
+            st.markdown(msg["content"])
+            if msg.get("report") and msg.get("turn"):
+                turn_num = msg["turn"]
+                f_rep = msg["report"]
+                f_md = msg["content"]
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.download_button(
+                        f"📥 Download report_followup_{turn_num}.md",
+                        f_md,
+                        f"report_followup_{turn_num}.md",
+                        mime="text/markdown",
+                        key=f"dl_f_{turn_num}_{idx}_md"
+                    )
+                with c2:
+                    st.download_button(
+                        f"📥 Download report_followup_{turn_num}.json",
+                        safe_json_dumps(f_rep, indent=1),
+                        f"report_followup_{turn_num}.json",
+                        mime="application/json",
+                        key=f"dl_f_{turn_num}_{idx}_json"
+                    )
+                if msg.get("cards"):
+                    f_card_files = msg["cards"].get("files", {})
+                    if f_card_files:
+                        st.markdown(f"##### 🃏 Expert Review Cards — Follow-up #{turn_num}")
+                        fc_cols = st.columns(len(f_card_files))
+                        for c_idx, (fn, content) in enumerate(f_card_files.items()):
+                            with fc_cols[c_idx]:
+                                st.download_button(f"📥 Download {fn}", content, fn, key=f"dl_f_cards_{turn_num}_{idx}_{fn}")
+                        with st.expander(f"🔍 Preview Review Cards (Follow-up #{turn_num})", expanded=False):
+                            st.markdown(f_card_files.get(f"cards_followup_{turn_num}.md", ""))
 
-    st.markdown(f"**Executive Summary:** {res.get('summary')}")
-
-    # Tabs for detailed breakdown
-    tab_issues, tab_math, tab_edges, tab_teach = st.tabs([
-        f"🚨 Issue Board ({len(res.get('issues', []))})",
-        "🧮 Level 0 Math Firewall",
-        "📐 Edge Conditions & Green Flags",
-        "🎓 Socratic Teach Pack",
-    ])
-
-    with tab_issues:
-        st.subheader("Identified Physical & Mathematical Vulnerabilities")
-        if not res.get("issues"):
-            st.info("No physical contradictions or fatal vulnerabilities identified.")
-        else:
-            for i, iss in enumerate(res.get("issues", []), 1):
-                sev = iss.get("severity", "MODERATE")
-                badge = "🔴 FATAL" if sev == "FATAL" else ("🟠 HIGH" if sev == "HIGH" else "🟡 MODERATE")
-                verified = iss.get("verified", False)
-                ver_badge = "✅ Verbatim Quote Verified" if verified else "⚠️ Check Source"
-
-                with st.expander(f"{badge} Issue #{i}: {iss.get('claim')}", expanded=True):
-                    st.markdown(f"**Physical Violation:** {iss.get('contradiction')}")
-                    st.markdown(f"**Governing Law:** `{iss.get('physical_law')}`")
-                    st.markdown(f"**Authoritative Source:** *{iss.get('source')}* ({ver_badge})")
-                    st.info(f"\"{iss.get('quote')}\"")
-
-    with tab_math:
-        st.subheader("Deterministic Equation & Dimensional Validation (SymPy / Pint)")
-        math_res = res.get("math_firewall", {})
-        if math_res.get("firewall_passed"):
-            st.success("✅ All extracted equations passed dimensional consistency checks.")
-        else:
-            st.error("❌ Dimensional inconsistency detected in proposed equations.")
-
-        if math_res.get("equations"):
-            st.write(f"**Extracted Equations ({len(math_res['equations'])}):**")
-            for eq in math_res["equations"]:
-                st.code(eq, language="python")
-        else:
-            st.caption("No mathematical equations detected in the input payload.")
-
-    with tab_edges:
-        col_ec, col_gf = st.columns(2)
-        with col_ec:
-            st.subheader("Required Boundary Conditions")
-            for ec in res.get("edge_conditions", []):
-                st.markdown(f"- **`{ec.get('parameter')}`:** `{ec.get('threshold')}`")
-                st.caption(ec.get("rationale"))
-
-        with col_gf:
-            st.subheader("Grounded Green Flags")
-            for gf in res.get("green_flags", []):
-                st.markdown(f"- **{gf.get('claim')}**")
-                st.caption(f"Consistent with *{gf.get('principle')}* ({gf.get('source')})")
-
-    with tab_teach:
-        st.subheader("Socratic Learning Pack (`teach_pack.md`)")
-        teach_md = generate_teach_pack(
-            hypothesis_text=st.session_state.get("last_hypothesis", ""),
-            blind_guess=st.session_state.get("last_blind_guess", ""),
-            verdict=res.get("verdict", ""),
-            issues=res.get("issues", []),
-            edge_conditions=res.get("edge_conditions", []),
-            notebooklm_url=os.environ.get("NOTEBOOKLM_URL", ""),
-        )
-        st.download_button(
-            "📥 Download teach_pack.md",
-            teach_md,
-            file_name="teach_pack.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-        st.markdown(teach_md)
+    if st.session_state.get("session_active", True):
+        prompt = st.chat_input("Enter a follow-up prompt, probe, or refined hypothesis (or 'exit')...")
+        if prompt:
+            if prompt.strip().lower() in ("exit", "quit", "q", ":q"):
+                st.session_state["session_active"] = False
+                st.warning("Session ended. You can safely close this browser tab or restart a session.")
+                st.rerun()
+            else:
+                st.session_state.setdefault("follow_up_history", []).append({"role": "user", "content": prompt})
+                try:
+                    gen = backend(gen_name)
+                    crit = gen if critic_name == "same as generator" else backend(critic_name)
+                    turn_idx = len(st.session_state.get("followup_reports", [])) + 1
+                    with st.spinner(f"Conducting continuous literature research for Follow-up #{turn_idx}..."):
+                        parent_to_use = st.session_state.get("latest_report") or rep
+                        f_rep = engine.run_followup(
+                            parent_to_use,
+                            prompt,
+                            books or books_default(corpus),
+                            gen,
+                            crit,
+                            engine.LocalBM25(corpus),
+                            turn_idx=turn_idx,
+                            auto_entail=entail,
+                            check_math=check_math,
+                            log=lambda m: None
+                        )
+                        f_cards = None
+                        if review:
+                            f_cards = triage.build(f_rep, label=f"Follow-up #{turn_idx}", prefix=f"cards_followup_{turn_idx}")
+                    st.session_state.setdefault("followup_reports", []).append(f_rep)
+                    st.session_state["latest_report"] = f_rep
+                    f_md = engine.render_followup(f_rep)
+                    st.session_state["follow_up_history"].append({
+                        "role": "assistant",
+                        "content": f_md,
+                        "report": f_rep,
+                        "turn": turn_idx,
+                        "cards": f_cards
+                    })
+                    st.rerun()
+                except Exception as e:
+                    if st.session_state.get("follow_up_history") and st.session_state["follow_up_history"][-1].get("role") == "user":
+                        st.session_state["follow_up_history"].pop()
+                    import traceback
+                    traceback.print_exc()
+                    st.error(f"Error evaluating follow-up #{turn_idx}: {e}")
+                    with st.expander("🔍 Show Detailed Error Diagnostics", expanded=True):
+                        st.exception(e)
